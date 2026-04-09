@@ -1,127 +1,253 @@
-from pymongo import MongoClient
+"""
+CSE 512 — Assignment 1 (MongoDB Aggregation via PyMongo)
+Author: Luna Sbahtu
+Date: 2025-09-18
+
+How to use
+----------
+1) Ensure MongoDB is running (e.g., via Docker):
+   docker pull mongo:7
+   docker run -d --name cse512-mongo -p 27017:27017 mongo:7
+
+2) Create/activate your virtual environment, then install:
+   pip install pymongo
+
+3) Export 100 JSON rows from Mockaroo (array of objects) and set the path below.
+
+4) Run:
+   python assignment1_solution.py
+
+Notes
+-----
+- By default this script connects to a local MongoDB at mongodb://localhost:27017
+  You can override via the MONGODB_URI environment variable.
+- The script creates/uses database "ecommerce" and collection "orders".
+- It prints results for Parts 3–9 of the assignment.
+"""
+
+import os
 import json
-import random
-from datetime import datetime, timedelta
+from typing import List, Dict, Any
+from pymongo import MongoClient
+from pymongo.collection import Collection
+from pymongo.errors import BulkWriteError
+from pprint import pprint
 
-# Database configuration
-DATABASE_NAME = 'ecommerce'
-COLLECTION_NAME = 'orders'
+# ==== Configuration ====
+DATABASE_NAME = "ecommerce"
+COLLECTION_NAME = "orders"
 
-client = MongoClient('mongodb://localhost:27017/')
-db = client[DATABASE_NAME]
-collection = db[COLLECTION_NAME]
+# Set this to your downloaded Mockaroo file (JSON array)
+# Example: r"C:\Users\you\Downloads\mock_orders.json" or "./mock_orders.json"
+MOCK_DATA_PATH = os.environ.get("MOCK_DATA_PATH", "./mock_orders.json")
 
-# ─────────────────────────────────────────────
-# Sample data generator
-# ─────────────────────────────────────────────
-
-PRODUCTS = ['Laptop', 'Phone', 'Tablet', 'Monitor', 'Keyboard', 'Mouse', 'Headphones', 'Camera']
-STATES = ['CA', 'TX', 'NY', 'FL', 'WA', 'IL', 'PA', 'OH', 'GA', 'NC']
-CITIES = {
-    'CA': 'Los Angeles', 'TX': 'Houston', 'NY': 'New York City',
-    'FL': 'Miami', 'WA': 'Seattle', 'IL': 'Chicago',
-    'PA': 'Philadelphia', 'OH': 'Columbus', 'GA': 'Atlanta', 'NC': 'Charlotte'
-}
+# Mongo connection (use env var if provided, otherwise localhost)
+MONGODB_URI = os.environ.get("MONGODB_URI", "mongodb://localhost:27017")
 
 
-def insert_mock_data():
-    """Inserts mock e-commerce order data into MongoDB."""
-    collection.drop()
-    orders = []
-    base_date = datetime(2021, 1, 1)
+def get_collection() -> Collection:
+    client = MongoClient(MONGODB_URI)
+    db = client[DATABASE_NAME]
+    return db[COLLECTION_NAME]
 
-    for i in range(500):
-        state = random.choice(STATES)
-        order_date = base_date + timedelta(days=random.randint(0, 365))
-        orders.append({
-            'order_id': f'ORD-{i+1:04d}',
-            'customer': f'Customer_{random.randint(1, 200)}',
-            'product': random.choice(PRODUCTS),
-            'amount': round(random.uniform(50, 3000), 2),
-            'state': state,
-            'city': CITIES[state],
-            'order_date': order_date.strftime('%m/%d/%Y')
+
+# ========== Part 3 ==========
+def insert_mock_data(json_path: str = MOCK_DATA_PATH) -> None:
+    """
+    Inserts the generated Mockaroo data (JSON array) into MongoDB.
+    Prints the inserted ObjectIds and collection count after insert.
+    """
+    col = get_collection()
+
+    if not os.path.exists(json_path):
+        print(f"[insert_mock_data] File not found: {json_path}")
+        print("Please export your 100-row JSON array from Mockaroo and update MOCK_DATA_PATH.")
+        return
+
+    # Load JSON; expect an array of objects
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, list):
+        print("[insert_mock_data] Expected a JSON array of order objects.")
+        return
+
+    # Optional: clean collection before insert to avoid duplicates during re-runs
+    # Comment out the next line if you prefer to keep previous data
+    col.delete_many({})
+
+    try:
+        result = col.insert_many(data, ordered=False)
+        print(f"[insert_mock_data] Inserted {len(result.inserted_ids)} documents.")
+        print("Inserted _ids (first 10 shown):")
+        for oid in result.inserted_ids[:10]:
+            print(f"  {oid}")
+    except BulkWriteError as bwe:
+        print("[insert_mock_data] Bulk write error (likely duplicate keys). Summary:")
+        print(bwe.details)
+
+
+# ========== Part 4 ==========
+def find_order_totals() -> None:
+    """
+    Finds the total number of orders and the number of orders per state,
+    sorted by count in ascending order.
+    """
+    col = get_collection()
+
+    total_orders = col.count_documents({})
+    print(f"[find_order_totals] Total number of orders: {total_orders}")
+
+    pipeline = [
+        {"$group": {"_id": "$state", "count": {"$sum": 1}}},
+        {"$sort": {"count": 1, "_id": 1}}  # ascending by count, tie-break by state name
+    ]
+
+    print("[find_order_totals] Orders per state (ascending by count):")
+    for doc in col.aggregate(pipeline):
+        state = doc["_id"]
+        count = doc["count"]
+        print(f"  {state:20s}  {count}")
+
+
+# ========== Part 5 ==========
+def find_product_frequencies() -> None:
+    """
+    Finds the products and their frequencies sorted by frequency in descending order.
+    Assumes field 'product_id' exists (as per the sample).
+    """
+    col = get_collection()
+
+    pipeline = [
+        {"$group": {"_id": "$product_id", "frequency": {"$sum": 1}}},
+        {"$sort": {"frequency": -1, "_id": 1}}
+    ]
+
+    print("[find_product_frequencies] product_id frequencies (descending):")
+    for doc in col.aggregate(pipeline):
+        pid = doc["_id"]
+        freq = doc["frequency"]
+        print(f"  product_id={pid:<6}  frequency={freq}")
+
+
+# ========== Part 6 ==========
+def ca_highvalue_orders(threshold: float = 1000.0) -> None:
+    """
+    Counts and prints orders in California with total_price > threshold.
+    """
+    col = get_collection()
+    query = {"state": "California", "total_price": {"$gt": threshold}}
+
+    count = col.count_documents(query)
+    print(f"[ca_highvalue_orders] Count (California, total_price > {threshold}): {count}")
+
+    # Print a few sample orders (limit 10 to keep console readable)
+    print("[ca_highvalue_orders] Sample orders (up to 10):")
+    for doc in col.find(query).limit(10):
+        # Show key fields only for readability
+        print({
+            "order_id": doc.get("order_id"),
+            "customer_id": doc.get("customer_id"),
+            "total_price": doc.get("total_price"),
+            "city": doc.get("city"),
+            "order_date": doc.get("order_date")
         })
 
-    collection.insert_many(orders)
-    print(f"Inserted {len(orders)} orders into '{DATABASE_NAME}.{COLLECTION_NAME}'")
 
-
-def find_order_totals():
-    """Finds the total number of orders and number of orders per state, sorted ascending."""
-    total = collection.count_documents({})
-    print(f"\nTotal Orders: {total}")
+# ========== Part 7 ==========
+def top_states_highvalue(threshold: float = 500.0, top_k: int = 10) -> None:
+    """
+    Finds the top K states with the most orders where total_price > threshold.
+    Prints rank, state, and order count.
+    """
+    col = get_collection()
 
     pipeline = [
-        {'$group': {'_id': '$state', 'count': {'$sum': 1}}},
-        {'$sort': {'count': 1}}
+        {"$match": {"total_price": {"$gt": threshold}}},
+        {"$group": {"_id": "$state", "order_count": {"$sum": 1}}},
+        {"$sort": {"order_count": -1, "_id": 1}},
+        {"$limit": top_k}
     ]
-    results = list(collection.aggregate(pipeline))
-    print("\nOrders per State (ascending):")
-    for r in results:
-        print(f"  {r['_id']}: {r['count']} orders")
+
+    print(f"[top_states_highvalue] Top {top_k} states (total_price > {threshold}):")
+    rank = 1
+    for doc in col.aggregate(pipeline):
+        state = doc["_id"]
+        cnt = doc["order_count"]
+        print(f"  #{rank:<2} {state:20s} {cnt}")
+        rank += 1
 
 
-def find_product_frequencies():
-    """Finds products and their frequencies sorted by frequency descending."""
+# ========== Part 8 ==========
+def find_customer_premium(state: str = "Texas", threshold: float = 2000.0) -> None:
+    """
+    Counts and finds the customers who placed premium orders (total_price > threshold)
+    in the given state. Prints distinct customer count and their info.
+    """
+    col = get_collection()
+
     pipeline = [
-        {'$group': {'_id': '$product', 'frequency': {'$sum': 1}}},
-        {'$sort': {'frequency': -1}}
+        {"$match": {"state": state, "total_price": {"$gt": threshold}}},
+        {"$group": {"_id": "$customer_id", "orders": {"$push": "$$ROOT"}, "premium_count": {"$sum": 1}}},
+        {"$sort": {"premium_count": -1, "_id": 1}}
     ]
-    results = list(collection.aggregate(pipeline))
-    print("\nProduct Frequencies:")
-    for r in results:
-        print(f"  {r['_id']}: {r['frequency']}")
+
+    premium_customers: List[Dict[str, Any]] = list(col.aggregate(pipeline))
+    print(f"[find_customer_premium] Distinct customers in {state} with total_price > {threshold}: {len(premium_customers)}")
+
+    # Print a short summary per customer
+    for entry in premium_customers[:10]:  # cap at 10 customers for console readability
+        cid = entry["_id"]
+        pcnt = entry["premium_count"]
+        print(f"  customer_id={cid}  premium_orders={pcnt}")
+        # Optionally show first order's brief info
+        first_order = entry["orders"][0] if entry["orders"] else {}
+        if first_order:
+            print("    example_order:", {
+                "order_id": first_order.get("order_id"),
+                "total_price": first_order.get("total_price"),
+                "city": first_order.get("city"),
+                "order_date": first_order.get("order_date")
+            })
 
 
-def ca_highvalue_orders():
-    """Counts and finds orders in California where amount exceeds $1,000."""
-    query = {'state': 'CA', 'amount': {'$gt': 1000}}
-    results = list(collection.find(query, {'_id': 0, 'order_id': 1, 'customer': 1, 'amount': 1}))
-    print(f"\nHigh-Value Orders in CA (> $1,000): {len(results)}")
-    for r in results[:5]:
-        print(f"  {r['order_id']} | {r['customer']} | ${r['amount']:.2f}")
+# ========== Part 9 ==========
+def find_orders_by_date(order_date: str, city_aliases: List[str] = None) -> None:
+    """
+    Counts and finds the orders placed in New York City on a specific date.
+    order_date should match the string format used in your dataset, e.g., '10/21/2021'.
+    Some datasets use 'New York' and others 'New York City'; we'll match both by default.
+    """
+    if city_aliases is None:
+        city_aliases = ["New York City", "New York"]
+
+    col = get_collection()
+    query = {"order_date": order_date, "city": {"$in": city_aliases}}
+
+    count = col.count_documents(query)
+    print(f"[find_orders_by_date] NYC orders on {order_date}: {count}")
+    for doc in col.find(query).limit(10):
+        print({
+            "order_id": doc.get("order_id"),
+            "customer_id": doc.get("customer_id"),
+            "total_price": doc.get("total_price"),
+            "city": doc.get("city"),
+            "order_date": doc.get("order_date")
+        })
 
 
-def top_states_highvalue():
-    """Finds the top 10 states with the most orders where amount exceeds $500."""
-    pipeline = [
-        {'$match': {'amount': {'$gt': 500}}},
-        {'$group': {'_id': '$state', 'count': {'$sum': 1}}},
-        {'$sort': {'count': -1}},
-        {'$limit': 10}
-    ]
-    results = list(collection.aggregate(pipeline))
-    print("\nTop 10 States with Orders > $500:")
-    for r in results:
-        print(f"  {r['_id']}: {r['count']} orders")
-
-
-def find_customer_premium():
-    """Counts and finds customers who placed premium orders (> $2,000) in Texas."""
-    query = {'state': 'TX', 'amount': {'$gt': 2000}}
-    results = list(collection.find(query, {'_id': 0, 'customer': 1, 'amount': 1, 'product': 1}))
-    print(f"\nPremium Customers in TX (> $2,000): {len(results)}")
-    for r in results[:5]:
-        print(f"  {r['customer']} | {r['product']} | ${r['amount']:.2f}")
-
-
-def find_orders_by_date(order_date):
-    """Counts and finds orders placed in New York City on a specific date."""
-    query = {'city': 'New York City', 'order_date': order_date}
-    results = list(collection.find(query, {'_id': 0}))
-    print(f"\nOrders in NYC on {order_date}: {len(results)}")
-    for r in results:
-        print(f"  {r['order_id']} | {r['customer']} | ${r['amount']:.2f}")
-
-
-if __name__ == '__main__':
+def main() -> None:
+    # Run all parts in sequence. Adjust the order/date as needed.
     insert_mock_data()
     find_order_totals()
     find_product_frequencies()
     ca_highvalue_orders()
     top_states_highvalue()
     find_customer_premium()
-
-    specific_date = '1/9/2021'
+    # Example date in the format used by your data
+    specific_date = "1/9/2021"
     find_orders_by_date(specific_date)
+
+
+if __name__ == "__main__":
+    main()
